@@ -321,52 +321,127 @@
     ];
   }
 
-  // ---------- persistence ----------
-  async function loadData(){
-    try{
-      var r = await window.storage.get(STORAGE_ITEMS, true);
-      state.items = r ? JSON.parse(r.value) : null;
-    }catch(e){ state.items = null; }
-    if(!state.items){
-      state.items = seedItems();
-      try{ await window.storage.set(STORAGE_ITEMS, JSON.stringify(state.items), true); }catch(e){}
+  // ---------- persistence + sincronización entre roles ----------
+  // Dónde viven los datos (se elige automáticamente, en este orden):
+  //  1) NUBE: si pegas abajo tu URL de npoint.io -> funciona publicado en internet,
+  //     todos los usuarios (admin, almacenista, técnico) comparten el mismo inventario.
+  //  2) Almacenamiento compartido de Claude: si la app corre dentro de Claude.
+  //  3) Este navegador (localStorage): solo para pruebas, NO se comparte entre personas.
+  var SYNC_URL = "PEGA_AQUI_TU_URL_DE_NPOINT";
+  var SYNC_ENABLED = SYNC_URL.indexOf("http") === 0;
+  var HAS_CLAUDE_STORAGE = !!(window.storage && typeof window.storage.get === "function");
+  var BACKEND = SYNC_ENABLED ? "cloud" : (HAS_CLAUDE_STORAGE ? "claude" : "local");
+  var POLL_MS = 8000; // cada cuántos ms se revisan cambios hechos por otros usuarios
+  var KEYMAP = {items:STORAGE_ITEMS, movimientos:STORAGE_MOVS, config:STORAGE_CONFIG};
+  var savingCount = 0;
+
+  async function readAll(){
+    if(BACKEND === "cloud"){
+      var res = await fetch(SYNC_URL, {cache:"no-store"});
+      if(!res.ok) throw new Error("lectura");
+      var d = await res.json();
+      return (d && typeof d === "object") ? d : {};
     }
-    try{
-      var r2 = await window.storage.get(STORAGE_MOVS, true);
-      state.movs = r2 ? JSON.parse(r2.value) : [];
-    }catch(e){ state.movs = []; }
-    try{
-      var r3 = await window.storage.get(STORAGE_CONFIG, true);
-      state.config = r3 ? JSON.parse(r3.value) : null;
-    }catch(e){ state.config = null; }
-    if(!state.config){
-      state.config = {almacenistaPassword: DEFAULT_ALMACENISTA_PASSWORD, adminPassword: DEFAULT_ADMIN_PASSWORD};
-      try{ await window.storage.set(STORAGE_CONFIG, JSON.stringify(state.config), true); }catch(e){}
+    var out = {};
+    for(var part in KEYMAP){
+      var raw = null;
+      try{
+        if(BACKEND === "claude"){ var r = await window.storage.get(KEYMAP[part], true); raw = r ? r.value : null; }
+        else{ raw = localStorage.getItem(KEYMAP[part]); }
+      }catch(e){ raw = null; }
+      if(raw){ try{ out[part] = JSON.parse(raw); }catch(e){} }
     }
-    if(!state.config.adminPassword){
-      state.config.adminPassword = DEFAULT_ADMIN_PASSWORD;
-      try{ await window.storage.set(STORAGE_CONFIG, JSON.stringify(state.config), true); }catch(e){}
-    }
-    state.booted = true;
-    render();
-  }
-  async function persistItems(){
-    try{ await window.storage.set(STORAGE_ITEMS, JSON.stringify(state.items), true); }
-    catch(e){ showToast("No se pudo guardar el inventario.", true); }
-  }
-  async function persistMovs(){
-    try{ await window.storage.set(STORAGE_MOVS, JSON.stringify(state.movs), true); }
-    catch(e){ showToast("No se pudo guardar el movimiento.", true); }
-  }
-  async function persistConfig(){
-    try{ await window.storage.set(STORAGE_CONFIG, JSON.stringify(state.config), true); }
-    catch(e){ showToast("No se pudo guardar la configuración.", true); }
+    return out;
   }
 
+  async function writeParts(parts){
+    var payload = {items:state.items, movimientos:state.movs, config:state.config};
+    if(BACKEND === "cloud"){
+      // Se lee lo último de la nube y solo se reemplaza la parte que cambió.
+      var current = await readAll();
+      parts.forEach(function(p){ current[p] = payload[p]; });
+      var res = await fetch(SYNC_URL, {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(current)});
+      if(!res.ok) throw new Error("escritura");
+      return;
+    }
+    for(var i = 0; i < parts.length; i++){
+      var val = JSON.stringify(payload[parts[i]]);
+      if(BACKEND === "claude"){ await window.storage.set(KEYMAP[parts[i]], val, true); }
+      else{ localStorage.setItem(KEYMAP[parts[i]], val); }
+    }
+  }
+
+  async function save(parts, errMsg){
+    savingCount++;
+    try{ await writeParts(parts); return true; }
+    catch(e){ showToast(errMsg, true); return false; }
+    finally{ savingCount--; }
+  }
+  function persistItems(){ return save(["items"], "No se pudo guardar el inventario."); }
+  function persistMovs(){ return save(["movimientos"], "No se pudo guardar el movimiento."); }
+  function persistConfig(){ return save(["config"], "No se pudo guardar la configuración."); }
+
+  function defaultConfig(){
+    return {almacenistaPassword: DEFAULT_ALMACENISTA_PASSWORD, adminPassword: DEFAULT_ADMIN_PASSWORD};
+  }
+
+  async function loadData(){
+    var remote = {}, readOk = true;
+    try{ remote = await readAll(); }catch(e){ remote = {}; readOk = false; }
+    var seeded = false, cfgFixed = false;
+    if(Array.isArray(remote.items)){ state.items = remote.items; } else { state.items = seedItems(); seeded = true; }
+    state.movs = Array.isArray(remote.movimientos) ? remote.movimientos : [];
+    if(remote.config && typeof remote.config === "object"){ state.config = remote.config; }
+    else { state.config = defaultConfig(); cfgFixed = true; }
+    if(!state.config.adminPassword){ state.config.adminPassword = DEFAULT_ADMIN_PASSWORD; cfgFixed = true; }
+    if(!state.config.almacenistaPassword){ state.config.almacenistaPassword = DEFAULT_ALMACENISTA_PASSWORD; cfgFixed = true; }
+    state.booted = true;
+    render();
+    if(readOk){
+      if(seeded) persistItems();
+      if(cfgFixed) persistConfig();
+    }
+    setInterval(pollRemote, POLL_MS);
+    document.addEventListener("visibilitychange", function(){ if(!document.hidden) pollRemote(); });
+    window.addEventListener("focus", pollRemote);
+  }
+
+  // Revisa si otro usuario (p. ej. el almacenista tras importar un Excel) cambió
+  // algo y, si es así, actualiza la pantalla de quien esté conectado en cualquier rol.
+  async function pollRemote(){
+    if(!state.booted || savingCount > 0) return;
+    var remote;
+    try{ remote = await readAll(); }catch(e){ return; }
+    if(savingCount > 0) return;
+    var itemsChanged = false, changed = false;
+    if(Array.isArray(remote.items) && JSON.stringify(remote.items) !== JSON.stringify(state.items)){
+      state.items = remote.items; itemsChanged = true; changed = true;
+    }
+    if(Array.isArray(remote.movimientos) && JSON.stringify(remote.movimientos) !== JSON.stringify(state.movs)){
+      state.movs = remote.movimientos; changed = true;
+    }
+    if(remote.config && typeof remote.config === "object" && JSON.stringify(remote.config) !== JSON.stringify(state.config)){
+      state.config = remote.config;
+    }
+    // No se redibuja en el login (se borraría lo escrito) ni con un formulario abierto.
+    if(!changed || !state.user || state.modal) return;
+    var ae = document.activeElement;
+    var focusSearch = ae && ae.id === "searchInput";
+    var pos = focusSearch ? ae.selectionStart : 0;
+    render();
+    if(focusSearch){
+      var ni = document.getElementById("searchInput");
+      if(ni){ ni.focus(); ni.setSelectionRange(pos, pos); }
+    }
+    if(itemsChanged) showToast("Inventario actualizado con los últimos cambios.");
+  }
+
+  var toastTimer = null;
   function showToast(msg, isErr){
     state.toast = {msg:msg, err:!!isErr};
-    render();
-    setTimeout(function(){ state.toast=null; render(); }, 2600);
+    renderToast();
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(function(){ state.toast=null; renderToast(); }, 2600);
   }
 
   // ---------- derived helpers ----------
@@ -453,12 +528,21 @@
         creados++;
       }
     });
-    persistItems();
-    state.importSummary = "Importación completa: " + creados + " ítem(s) creados, " + actualizados + " actualizados" + (ignorados? (", " + ignorados + " fila(s) ignoradas por falta de nombre"):"") + ".";
-    showToast(state.importSummary);
+    var resumen = "Importación completa: " + creados + " ítem(s) creados, " + actualizados + " actualizados" + (ignorados? (", " + ignorados + " fila(s) ignoradas por falta de nombre"):"") + ".";
     renderContent();
+    persistItems().then(function(ok){
+      if(ok){
+        state.importSummary = resumen + " Ya está disponible para administrador, almacenista y técnicos.";
+        showToast(resumen);
+      }else{
+        state.importSummary = resumen + " ATENCIÓN: no se pudo guardar para los demás usuarios.";
+      }
+      renderContent();
+    });
   }
+  function canImportInventory(){ return !!state.user && (state.user.role==="admin" || state.user.role==="almacenista"); }
   function handleImportFile(file){
+    if(!canImportInventory()){ showToast("Tu rol no puede importar inventario.", true); return; }
     if(typeof XLSX==="undefined"){ showToast("No se pudo cargar el módulo de Excel.", true); return; }
     var reader = new FileReader();
     reader.onload = function(e){
@@ -526,6 +610,7 @@
     }
     if(editingId){
       var it = findItem(editingId);
+      if(!it){ showToast("Ese ítem ya no existe en el inventario.", true); closeModal(); return; }
       Object.assign(it, data);
       showToast("Ítem actualizado: " + data.nombre);
     }else{
@@ -551,6 +636,7 @@
     var cant = Number(form.cantidad.value);
     if(!cant || cant<=0){ showToast("Ingresa una cantidad válida.", true); return; }
     var it = findItem(itemId);
+    if(!it){ showToast("Ese ítem ya no existe en el inventario.", true); closeModal(); return; }
     it.stock = Number(it.stock) + cant;
     persistItems();
     addMov({tipo:"entrada", itemId:itemId, itemNombre:it.nombre, itemCodigo:it.codigo, cantidad:cant, motivo: form.motivo.value.trim() || "Recepción de mercancía"});
@@ -561,6 +647,7 @@
   function registrarSalida(form, itemId){
     var cant = Number(form.cantidad.value);
     var it = findItem(itemId);
+    if(!it){ showToast("Ese ítem ya no existe en el inventario.", true); closeModal(); return; }
     if(!cant || cant<=0){ showToast("Ingresa una cantidad válida.", true); return; }
     if(cant > Number(it.stock)){ showToast("No hay suficiente stock disponible (" + it.stock + " " + it.unidad + ").", true); return; }
     if(!form.motivo.value.trim()){ showToast("Indica el motivo o la orden de trabajo.", true); return; }
@@ -575,6 +662,7 @@
     var nuevo = Number(form.nuevoStock.value);
     if(nuevo < 0 || isNaN(nuevo)){ showToast("Ingresa un stock válido.", true); return; }
     var it = findItem(itemId);
+    if(!it){ showToast("Ese ítem ya no existe en el inventario.", true); closeModal(); return; }
     var diff = nuevo - Number(it.stock);
     it.stock = nuevo;
     persistItems();
@@ -813,7 +901,7 @@
   function renderInventario(el){
     var list = filteredItems();
     var cats = categorias();
-    var isAdmin = state.user.role==="admin";
+    var canImport = canImportInventory();
     var html = ''+
     '<div class="panel">'+
       '<div class="toolbar">'+
@@ -824,7 +912,7 @@
         '</select>'+
         '<div class="toolbar-actions">'+
           '<button type="button" class="icon-btn" id="exportInvBtn">⬇ Exportar Excel</button>'+
-          (isAdmin ? '<button type="button" class="icon-btn" id="importInvBtn">⬆ Importar Excel</button><input type="file" id="importInvFile" accept=".xlsx,.xls,.csv" style="display:none;">' : '')+
+          (canImport ? '<button type="button" class="icon-btn" id="importInvBtn">⬆ Importar Excel</button><input type="file" id="importInvFile" accept=".xlsx,.xls,.csv" style="display:none;">' : '')+
         '</div>'+
       '</div>'+
       (state.importSummary ? '<div class="import-summary">'+esc(state.importSummary)+'</div>' : '')+
